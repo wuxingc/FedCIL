@@ -26,7 +26,7 @@
   --num_users 5 \
   --com_round 100 \
   --local_ep 2 \
-  --beta 0.5 \
+  --beta 1.0 \
   --gpu 0 \
   --seed 2023 \
   --mem_size 500 \

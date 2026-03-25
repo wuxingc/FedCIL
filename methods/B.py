@@ -45,7 +45,7 @@ class IndexedDataset(Dataset):
         """
         返回子数据集的大小
         """
-        return len(self.indices)
+        return len(self.labels)
 
 def normalize(tensor, mean, std, reverse=False):
     if reverse:
@@ -106,6 +106,10 @@ class CustomConcatDataset(ConcatDataset):
     
 
 class FLDataSelector:
+    """
+    G-MDR 中的全局原型分支：对本地特征做随机正交掩码 (P F Q) 后做 SVD 杠杆采样，
+    与类内方差聚合得到的 M_old 配合使用（见 BBBB._select_data_for_retention）。
+    """
     def __init__(self, num_clients, local_features, query_budget):
         """
         初始化联邦数据选择器
@@ -200,6 +204,29 @@ class FLDataSelector:
         return client_selected_indices
 
 
+def _nanmean(tensor, dim):
+    """沿 dim 求均值并忽略 nan；兼容无 torch.nanmean 的旧版 PyTorch。"""
+    mask = ~torch.isnan(tensor)
+    summed = torch.where(mask, tensor, torch.zeros_like(tensor)).sum(dim=dim)
+    count = mask.float().sum(dim=dim)
+    out = summed / count.clamp(min=1.0)
+    out = torch.where(count > 0, out, torch.zeros_like(out))
+    return out
+
+
+def aggregate_oldclass_base_margin(client_sigma2_list, num_old_classes, eps=1e-8):
+    """
+    服务端：聚合各客户端上传的每旧类平均对角方差，得到全局基础半径 M_old（逐类标量）。
+    client_sigma2_list: list of Tensor [num_old_classes]，无样本的类为 nan
+    """
+    if num_old_classes <= 0:
+        return None, None
+    stacked = torch.stack([s.float() for s in client_sigma2_list], dim=0)
+    sigma2_global = _nanmean(stacked, dim=0)
+    sigma2_global = torch.nan_to_num(sigma2_global, nan=0.0, posinf=0.0, neginf=0.0)
+    m_old = torch.sqrt(sigma2_global.clamp_min(0.0) + eps)
+    return sigma2_global, m_old
+
 
 class BBBB(BaseLearner):
     def __init__(self, args):
@@ -213,6 +240,9 @@ class BBBB(BaseLearner):
         self.transform, self.normalizer = self._get_norm_and_transform(self.args["dataset"])
         self.selected_data_indices = []  # 用于存储每个任务选择的数据索引
         self.retained_ds_all = [[] for _ in range(args['num_users'])]
+        # G-MDR：服务端聚合后广播给所有客户端的旧类特征空间基础半径 M_old[c]，与 sigma2 一致对齐旧类 id
+        self.M_old = None
+        self.sigma2_old_global = None
         
     def _get_norm_and_transform(self, dataset):
         """根据数据集返回归一化和数据增强方法"""
@@ -275,10 +305,17 @@ class BBBB(BaseLearner):
 
 
     def _select_data_for_retention(self):
-        """提取所有客户端的数据表征并进行数据选择"""
+        """G-MDR：提取各客户端当前任务特征做掩码+杠杆采样；并行收集旧类 σ²，服务端聚合为 M_old 并广播。"""
         all_client_features = []
         all_client_indices = []
+        num_old = self._known_classes
+        client_sigma2_list = []
+
         for client_idx in range(self.args["num_users"]):
+            if num_old > 0:
+                client_sigma2_list.append(
+                    self._extract_client_oldclass_sigma2_per_class(client_idx, num_old)
+                )
             try:
                 client_features, client_indices = self._extract_client_features(client_idx)
                 if len(client_features) > 0:  # 只添加非空的特征
@@ -287,13 +324,25 @@ class BBBB(BaseLearner):
             except ValueError as e:
                 print(f"Error extracting features for client {client_idx}: {e}")
                 continue  # 跳过出错的客户端
+
+        if num_old > 0 and len(client_sigma2_list) == self.args["num_users"]:
+            self.sigma2_old_global, self.M_old = aggregate_oldclass_base_margin(
+                client_sigma2_list, num_old
+            )
+            if self.M_old is not None:
+                self.logger.info(
+                    "G-MDR: global base margin M_old (per old class): %s"
+                    % self.M_old.detach().cpu().numpy().round(6).tolist()
+                )
+        else:
+            self.sigma2_old_global, self.M_old = None, None
         
         # 如果没有提取到任何特征，直接返回
         if len(all_client_features) == 0:
             print("No features extracted from any client. Skipping data selection.")
             return
 #         ipdb.set_trace()
-        # 在服务器端进行数据选择
+        # 服务器端：杠杆分数 + 采样（与 GDR 相同，作为 G-MDR 的全局原型分支）
         selector = FLDataSelector(self.args["num_users"], all_client_features, int((self._total_classes-self._known_classes) * self.mem_size))
         # 对本地数据进行掩码
         masked_features = selector.mask_local_data()
@@ -303,7 +352,7 @@ class BBBB(BaseLearner):
         p = selector.aggregate_leverage_scores(leverage_scores)
         # 采样数据
         selected_indices = selector.sample_data(p)
-        # 保存选中的数据索引
+        # 保存选中的数据索引（各客户端）；M_old / sigma2_old_global 已由服务端写入 learner，模拟下发给所有客户端
         self.selected_data_indices = selected_indices
 #         ipdb.set_trace()
     def _extract_client_features(self, client_idx):
@@ -330,8 +379,7 @@ class BBBB(BaseLearner):
         with torch.no_grad():
             for batch_idx, (_, images, labels) in enumerate(local_train_loader):
                 images = images.cuda()
-                output_list = self._network(images)
-                feature = output_list["att"]  # 提取表征
+                feature = self._forward_feature_for_gmdr(images)
                 features.append(feature.cpu())
                 start_idx = batch_idx * self.args["local_bs"]
                 end_idx = start_idx + images.size(0)
@@ -339,6 +387,61 @@ class BBBB(BaseLearner):
                
         features = torch.cat(features, dim=0)
         return features, indices
+
+    def _forward_feature_for_gmdr(self, images):
+        """与 GDR 杠杆分支一致：优先使用 convnet 的 att，否则退回 features。"""
+        output_list = self._network(images)
+        if "att" in output_list:
+            return output_list["att"]
+        return output_list["features"]
+
+    def _extract_client_oldclass_sigma2_per_class(self, client_idx, num_old_classes):
+        """
+        客户端：对本地回放记忆中的旧类样本提特征，计算每类协方差对角元的均值（类内方差标量 σ²）。
+        无该类样本的位置为 nan，供服务端 nanmean 聚合。
+        """
+        out = torch.full((num_old_classes,), float("nan"), dtype=torch.float32)
+        chunks = self.retained_ds_all[client_idx]
+        if num_old_classes <= 0 or not chunks:
+            return out
+
+        mem_ds = ConcatDataset(chunks)
+        loader = DataLoader(
+            mem_ds,
+            batch_size=self.args["local_bs"],
+            shuffle=False,
+            num_workers=self.args["num_worker"],
+            pin_memory=True,
+            multiprocessing_context=self.args["mulc"],
+            persistent_workers=True,
+            drop_last=False,
+        )
+        feats_by_class = [[] for _ in range(num_old_classes)]
+        self._network.eval()
+        with torch.no_grad():
+            for _, images, labels in loader:
+                images = images.cuda()
+                feat = self._forward_feature_for_gmdr(images)
+                feat_cpu = feat.cpu()
+                if isinstance(labels, torch.Tensor):
+                    labels_np = labels.cpu().numpy()
+                else:
+                    labels_np = np.asarray(labels)
+                for i in range(len(labels_np)):
+                    c = int(labels_np[i])
+                    if 0 <= c < num_old_classes:
+                        feats_by_class[c].append(feat_cpu[i].clone())
+
+        for c in range(num_old_classes):
+            if len(feats_by_class[c]) < 2:
+                continue
+            fmat = torch.stack(feats_by_class[c], dim=0)
+            mu = fmat.mean(dim=0)
+            centered = fmat - mu
+            diag_var = (centered ** 2).mean(dim=0)
+            out[c] = diag_var.mean()
+
+        return out
 
     def _get_retained_dataset(self, client_idx):
         """获取保留的数据集"""       
