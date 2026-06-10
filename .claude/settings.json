@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F: '{print $1}')",
+      "Bash(xargs -I {} sed -n '{}p' /home/pcl/cwx/FedCIL-main/methods/B.py)",
+      "Bash(grep -v \"^$\")",
+      "Bash(awk -F',' 'NR==1 || \\($1==1 && $11!=\"\"\\)' /home/pcl/cwx/FedCIL-main/run/bes_diagnostics/class_diagnostics.csv)",
+      "Bash(python utilstools/compute_forgetting.py run/bes_diagnostics/class_diagnostics.csv run/bes_diagnostics/class_diagnostics_with_forgetting.csv)",
+      "Bash(awk -F',' 'NR==1 || \\($1==1 && $11!=\"\"\\) {print $1\",\"$2\",\"$10\",\"$11\",\"$12}' /home/pcl/cwx/FedCIL-main/run/bes_diagnostics/class_diagnostics_with_forgetting.csv)",
+      "Bash(chmod +x /home/pcl/cwx/FedCIL-main/test_bes_v2.sh)"
+    ]
+  }
+}
